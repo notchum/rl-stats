@@ -1,7 +1,7 @@
 import os
 import json
-import time
 import pandas
+import click
 import requests
 import datetime
 from enum import Enum
@@ -41,8 +41,8 @@ def get_api_tier(api_key: str) -> str:
 
     return tier
 
-def list_replays(target_rank: Rank, amount: int) -> list:
-    rank = {
+def list_replays(target_rank: Rank, amount: int, from_date: datetime.datetime, to_date: datetime.datetime) -> list:
+    ranks = {
         Rank.Bronze: {"min": "bronze-1", "max": "bronze-3"},
         Rank.Silver: {"min": "silver-1", "max": "silver-3"},
         Rank.Gold: {"min": "gold-1", "max": "gold-3"},
@@ -52,18 +52,18 @@ def list_replays(target_rank: Rank, amount: int) -> list:
         Rank.GrandChampion: {"min": "grand-champion", "max": "grand-champion"}
     }
 
-    replay_date_after = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=2)).isoformat()
-    replay_date_before = datetime.datetime.now(datetime.timezone.utc).isoformat() 
     num_replays = 0
+    replays = []
     replay_ids = []
 
     while num_replays < amount:
         p = {
-            "min-rank": rank[target_rank]["min"],
-            "max-rank": rank[target_rank]["max"],
+            "min-rank": ranks[target_rank]["min"],
+            "max-rank": ranks[target_rank]["max"],
             "playlist": "ranked-doubles",
-            "replay-date-after": replay_date_after,
-            "replay-date-before": replay_date_before
+            "created-after": from_date,
+            "created-before": to_date,
+            "count": 100
         }
 
         r = requests.get(url=BALLCHASING_API_ENDPOINT+"/replays",
@@ -72,19 +72,25 @@ def list_replays(target_rank: Rank, amount: int) -> list:
         )
         if r.status_code != 200: r.raise_for_status()
 
+        if DEBUG: replays += r.json()["list"]
+
         replay_ids += [d["id"] for d in r.json()["list"]]
         print(f"replays before cull: {len(replay_ids)}")
         replay_ids = list(dict.fromkeys(replay_ids))
         print(f"replays after cull: {len(replay_ids)}")
         num_replays = len(replay_ids)
 
-        replay_date_before = r.json()["list"][len(r.json()["list"]) - 1]["created"]
+        to_date = r.json()["list"][len(r.json()["list"]) - 1]["created"]
+    
+    if DEBUG:
+        with open("replays.json", "w", encoding="utf-8") as f:
+            json.dump(replays, f, ensure_ascii=False, indent=4)
 
     return replay_ids
 
 
 def get_stats_from_replay(replay_id: str):
-    raw_stats = {
+    replay_stats = {
         "core": pandas.DataFrame(),
         "boost": pandas.DataFrame(),
         "movement": pandas.DataFrame(),
@@ -98,37 +104,62 @@ def get_stats_from_replay(replay_id: str):
     if r.status_code != 200: r.raise_for_status()
 
     for player in r.json()["blue"]["players"] + r.json()["orange"]["players"]:
-        # with open('data.json', 'w', encoding='utf-8') as f:
-        #     json.dump(player, f, ensure_ascii=False, indent=4)
-
         for stat_id in player["stats"].keys():
             if stat_id == "core":
                 del player["stats"][stat_id]["mvp"]
             df = pandas.DataFrame.from_dict({k:[v] for k, v in player["stats"][stat_id].items()})
-            raw_stats[stat_id] = pandas.concat([raw_stats[stat_id], df], ignore_index=True)
+            replay_stats[stat_id] = pandas.concat([replay_stats[stat_id], df], ignore_index=True)
     
-    return raw_stats
+    return replay_stats
 
-def main() -> None:
+@click.command()
+@click.option("--debug", is_flag=True)
+@click.option("--rank", default=7, show_default=True, type=int)
+@click.option("--replays", default=100, show_default=True, type=int)
+@click.option("--from", "from_date", required=True, type=click.DateTime(['%Y-%m-%d']))
+@click.option("--to", "to_date", required=True, type=click.DateTime(['%Y-%m-%d']))
+def main(debug: bool, rank: int, replays: int, from_date: datetime.datetime, to_date: datetime.datetime) -> None:
+    global DEBUG 
+    DEBUG = debug
+
     ballchasing_api_tier = get_api_tier(os.environ["BALLCHASING_API_KEY"])
 
-    replay_ids = list_replays(Rank.GrandChampion, 50)
+    replay_ids = list_replays(
+        target_rank=Rank(rank),
+        amount=replays,
+        from_date=from_date.astimezone(datetime.timezone.utc).isoformat(timespec="microseconds"),
+        to_date=to_date.astimezone(datetime.timezone.utc).isoformat(timespec="microseconds")
+    )
+
+    raw_stats = {
+        "core": pandas.DataFrame(),
+        "boost": pandas.DataFrame(),
+        "movement": pandas.DataFrame(),
+        "positioning": pandas.DataFrame(),
+        "demo": pandas.DataFrame()
+    }
 
     print(f"processing {len(replay_ids)} replays...")
-
-    results = []
     if ballchasing_api_tier != "regular":
+        # TODO -- not tested ^.^
         pool = ThreadPool(4)
         results = pool.map(get_stats_from_replay, replay_ids)
     else:
         with alive_bar(len(replay_ids)) as bar:
-            for replay in replay_ids:
+            for replay in replay_ids[:2]:
                 replay_stats = get_stats_from_replay(replay)
+                for stat_id in replay_stats.keys():
+                    raw_stats[stat_id] = pandas.concat([raw_stats[stat_id], replay_stats[stat_id]], ignore_index=True)
                 bar()
 
-    print()
-    # avg = raw_stats["boost"].mean()
-    # print(avg)
+    dir_name = f"{Rank.GrandChampion.name}-{from_date.strftime('%Y-%m-%d')}-{to_date.strftime('%Y-%m-%d')}"
+    os.makedirs(dir_name, exist_ok=True)
+    print(f"writing CSV data to {dir_name}...")
+
+    with alive_bar(len(raw_stats.keys())) as bar:
+        for key, value in raw_stats.items():
+            value.mean().to_csv(f"{dir_name}/{key}_mean.csv", float_format="{:.3f}".format)
+            bar()
 
 if __name__ == "__main__":
     main()

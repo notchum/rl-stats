@@ -2,3 +2,4 @@ python-dotenv
 requests
 pandas
 alive-progress
+click
